@@ -1051,6 +1051,10 @@ sub LEDStripe2_request_nonBlocking
                 <br />Some old commands remain available when set to 1.</li>
     <li><a name="power_switch"><code>attr &lt;name&gt; power_switch &lt;integer&gt;</code></a>
                 <br />Control LED power on/off using s switch channel</li>
+    <li><a name="useWebSocket"><code>attr &lt;name&gt; useWebSocket &lt;0|1&gt;</code></a>
+                <br />Enable WebSocket connection for real-time bidirectional communication (default: 0)</li>
+    <li><a name="websocketReconnectInterval"><code>attr &lt;name&gt; websocketReconnectInterval &lt;10|30|60|120&gt;</code></a>
+                <br />WebSocket reconnection interval in seconds when connection is lost (default: 30)</li>
   </ul>
 
   <a name="LEDStripe2_set"></a>
@@ -1172,6 +1176,47 @@ sub LEDStripe2_request_nonBlocking
                 <br />Start sparkling dots (white) light effect on all LEDs<br/></li>
     <li><a name="knightrider"><code>set &lt;name&gt; knightrider &lt;string&gt;</code></a>
                 <br />Start knightrider light effect on all LEDs<br/></li>
+  </ul>
+
+  <a name="LEDStripe2_WebSocket"></a>
+  <h4>WebSocket Support (NEW)</h4>
+  <ul>
+    The module now supports real-time bidirectional communication with LED stripe devices via WebSocket connections.
+    This provides instant updates when parameters are changed through the web interface or knob control.
+    <br/><br/>
+    <b>Requirements:</b> Perl modules Protocol::WebSocket::Client and IO::Socket::INET must be installed for WebSocket support.
+    The module will gracefully fall back to HTTP-only operation if these modules are not available.
+    <br/><br/>
+    <b>Configuration:</b>
+    <br/>
+    <li><code>attr &lt;name&gt; useWebSocket 1</code> - Enable WebSocket connection (default: 0)</li>
+    <li><code>attr &lt;name&gt; websocketReconnectInterval 30</code> - Reconnection interval in seconds (10,30,60,120; default: 30)</li>
+    <br/>
+    <b>Benefits:</b>
+    <ul>
+      <li>Real-time parameter updates from LED stripe to FHEM</li>
+      <li>Instant response to changes made via web interface or knob control</li>
+      <li>Reduced network overhead compared to HTTP polling</li>
+      <li>Automatic reconnection on connection loss</li>
+      <li>Connection health monitoring with ping/pong</li>
+    </ul>
+    <br/>
+    <b>Status Monitoring:</b>
+    <br/>
+    The WebSocket connection status is available in the <code>_WEBSOCKET_STATE</code> reading:
+    <ul>
+      <li><code>connected</code> - WebSocket connection active</li>
+      <li><code>disconnected</code> - WebSocket connection closed</li>
+      <li><code>not_available</code> - Required Perl modules not installed</li>
+      <li><code>error: &lt;message&gt;</code> - Connection error with details</li>
+    </ul>
+    <br/>
+    <b>Example Configuration:</b>
+    <pre>
+    define LED_Kitchen LEDStripe2 ip=192.168.1.100
+    attr LED_Kitchen useWebSocket 1
+    attr LED_Kitchen websocketReconnectInterval 30
+    </pre>
   </ul>
 </ul>
 
