@@ -1,0 +1,129 @@
+# FHEM LEDStripe2 WebSocket Test Configuration
+
+# This file contains example FHEM configurations for testing the WebSocket functionality
+# Copy and modify these examples according to your setup
+
+# =============================================================================
+# Basic WebSocket Test Configuration
+# =============================================================================
+
+# Define LED stripe device with WebSocket support
+define LED_Test LEDStripe2 ip=192.168.1.100
+attr LED_Test useWebSocket 1
+attr LED_Test websocketReconnectInterval 30
+attr LED_Test room LED_Test
+attr LED_Test group LED_Devices
+
+# Add some useful web commands for testing
+attr LED_Test webCmd power:brightness:effect:colorPalette:solidColor
+attr LED_Test webCmdLabel Power:Brightness:Effect:Palette:Color
+
+# =============================================================================
+# Advanced Test Configuration with Power Control
+# =============================================================================
+
+# LED stripe with power relay control
+define LED_Kitchen LEDStripe2 ip=192.168.1.101 interval=300
+attr LED_Kitchen useWebSocket 1
+attr LED_Kitchen websocketReconnectInterval 60
+attr LED_Kitchen power_switch Relay_Kitchen_LED
+attr LED_Kitchen room Kitchen
+attr LED_Kitchen group LED_Devices
+
+# Optional: Add state icon for visual feedback
+attr LED_Kitchen devStateIcon {ReadingsVal($name,"power","off") eq "on" ? "light_led_stripe_rgb@green" : "light_led_stripe_rgb@red"}
+
+# =============================================================================
+# Multiple LED Stripes Test Setup
+# =============================================================================
+
+# Living room main lighting
+define LED_LivingRoom_Main LEDStripe2 ip=192.168.1.102
+attr LED_LivingRoom_Main useWebSocket 1
+attr LED_LivingRoom_Main room LivingRoom
+attr LED_LivingRoom_Main alias "Living Room Main"
+
+# Living room accent lighting  
+define LED_LivingRoom_Accent LEDStripe2 ip=192.168.1.103
+attr LED_LivingRoom_Accent useWebSocket 1
+attr LED_LivingRoom_Accent room LivingRoom
+attr LED_LivingRoom_Accent alias "Living Room Accent"
+
+# =============================================================================
+# Monitoring and Notification Setup
+# =============================================================================
+
+# Create notify for WebSocket connection monitoring
+define notify_LED_WebSocket notify LED_.*:_WEBSOCKET_STATE:.* {
+  my $device = $NAME;
+  my $state = ReadingsVal($device, "_WEBSOCKET_STATE", "unknown");
+  
+  if ($state eq "connected") {
+    Log3($device, 3, "$device WebSocket connected successfully");
+  } elsif ($state =~ /^error:/) {
+    Log3($device, 2, "$device WebSocket error: $state");
+  } elsif ($state eq "disconnected") {
+    Log3($device, 3, "$device WebSocket disconnected, will reconnect");
+  }
+}
+
+# =============================================================================
+# Testing Commands
+# =============================================================================
+
+# Commands to test WebSocket functionality:
+#
+# 1. Check WebSocket status:
+#    get LED_Test _WEBSOCKET_STATE
+#
+# 2. Enable WebSocket (if not already enabled):
+#    attr LED_Test useWebSocket 1
+#
+# 3. Test parameter changes:
+#    set LED_Test power on
+#    set LED_Test brightness 128
+#    set LED_Test effect Rainbow_Cycle
+#
+# 4. Test real-time sync:
+#    - Change parameters via LED stripe web interface
+#    - Check if FHEM readings update automatically
+#    - Monitor logs: attr global verbose 4
+#
+# 5. Test reconnection:
+#    - Restart LED stripe device
+#    - Check if WebSocket reconnects automatically
+#
+# 6. Check connection health:
+#    - Monitor logs for ping/pong messages (verbose 5)
+
+# =============================================================================
+# Troubleshooting Configuration
+# =============================================================================
+
+# Enable detailed logging for WebSocket debugging
+# attr global verbose 4
+# attr LED_Test verbose 5
+
+# Check if WebSocket modules are available:
+# - In FHEM command line: { eval { require Protocol::WebSocket::Client; print "WebSocket modules available\n"; } or print "WebSocket modules missing\n"; }
+
+# Monitor readings for real-time updates:
+# attr LED_Test event-on-change-reading .*
+
+# =============================================================================
+# Performance Comparison Test
+# =============================================================================
+
+# Setup for comparing HTTP vs WebSocket performance:
+# 
+# 1. HTTP-only device (for comparison):
+define LED_HTTP_Only LEDStripe2 ip=192.168.1.104 interval=60
+attr LED_HTTP_Only useWebSocket 0
+attr LED_HTTP_Only room Test
+
+# 2. WebSocket-enabled device:
+define LED_WebSocket LEDStripe2 ip=192.168.1.105 interval=300
+attr LED_WebSocket useWebSocket 1
+attr LED_WebSocket room Test
+
+# Compare response times when changing parameters via web interface

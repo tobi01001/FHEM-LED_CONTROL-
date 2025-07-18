@@ -25,9 +25,25 @@ use warnings;
 use HTTP::Request;
 use LWP::UserAgent;
 use Switch;
-use Color;
 use JSON;
-use HttpUtils;
+
+# Optional FHEM-specific modules
+eval { require Color; };
+eval { require HttpUtils; };
+
+# Optional WebSocket support - gracefully degrade if modules not available
+my $hasWebSocketSupport = 0;
+eval {
+    require IO::Socket::INET;
+    require Protocol::WebSocket::Client;
+    require Digest::SHA;
+    import Digest::SHA qw(sha1_base64);
+    $hasWebSocketSupport = 1;
+};
+if ($@) {
+    # Log warning when FHEM is available, otherwise silently continue
+    # This will be logged during module initialization
+}
 #require 'HttpUtils.pm';
 
 my %Commands = (
@@ -37,6 +53,10 @@ my %Commands = (
 
 my @gets = sort keys(%Commands); ## just the basic. gets updated dynamically during define (with non blocking http call)
 my $callDelay = 1; 		### number of seconds a call is delayed using an internal Timer....
+
+# WebSocket support variables
+my %websocketClients = ();  # Hash to store WebSocket client objects by device name
+my %websocketHandlers = (); # Hash to store WebSocket message handlers by device name
 
 
 ##############################################
@@ -50,12 +70,251 @@ sub LEDStripe2_Initialize($)
   $hash->{NotifyFn}  = "LEDStripe2_Notify";
   $hash->{ReadFn}	 = "LEDStripe2_Read";
   $hash->{ReadyFn}	 = "LEDStripe2_Ready";
-  $hash->{AttrList}  = "power_switch disable:0,1 backwardCompatibility:0,1 ".$readingFnAttributes;
+  $hash->{UndefFn}   = "LEDStripe2_Undef";
+  $hash->{AttrList}  = "power_switch disable:0,1 backwardCompatibility:0,1 useWebSocket:0,1 websocketReconnectInterval:10,30,60,120 ".$readingFnAttributes;
   $hash->{cmds}      = ();
   $hash->{backwardCompatibility} = 0;
   $hash->{firstInit} = 1;
   #$hash->{sets}      = [];
+  
+  # Log WebSocket support availability
+  if ($hasWebSocketSupport) {
+    Log(2, "LEDStripe2_Initialize: WebSocket support available");
+  } else {
+    Log(2, "LEDStripe2_Initialize: WebSocket support not available (missing Protocol::WebSocket::Client or IO::Socket::INET)");
+  }
+  
   Log(2, "LEDStripe2_Initialize called");
+}
+
+###################################
+# WebSocket Support Functions
+###################################
+
+###################################
+sub LEDStripe2_WebSocket_Connect
+{
+	my ($hash) = @_;
+	my $name = $hash->{NAME};
+	my $remote_ip = $hash->{remote_ip};
+	my $remote_port = $hash->{remote_port} || 80;
+	
+	return "" if(IsDisabled($name));
+	return "" if(!AttrVal($name, "useWebSocket", 0));
+	
+	if (!$hasWebSocketSupport) {
+		Log3($name, 2, "LEDStripe2_WebSocket_Connect $name: WebSocket support not available. Please install Protocol::WebSocket::Client and IO::Socket::INET modules.");
+		readingsSingleUpdate($hash, "_WEBSOCKET_STATE", "not_available", 1);
+		return "";
+	}
+	
+	Log3($name, 4, "LEDStripe2_WebSocket_Connect $name: Attempting WebSocket connection to ws://$remote_ip:$remote_port/ws");
+	
+	# Close existing connection if any
+	LEDStripe2_WebSocket_Disconnect($hash);
+	
+	eval {
+		my $socket = IO::Socket::INET->new(
+			PeerHost => $remote_ip,
+			PeerPort => $remote_port,
+			Proto    => 'tcp',
+			Timeout  => 10,
+		);
+		
+		if (!$socket) {
+			Log3($name, 2, "LEDStripe2_WebSocket_Connect $name: Failed to create socket: $!");
+			return "";
+		}
+		
+		my $client = Protocol::WebSocket::Client->new(
+			url => "ws://$remote_ip:$remote_port/ws"
+		);
+		
+		$client->on(
+			read => sub {
+				my ($client, $buffer) = @_;
+				LEDStripe2_WebSocket_OnMessage($hash, $buffer);
+			}
+		);
+		
+		$client->on(
+			write => sub {
+				my ($client, $buffer) = @_;
+				syswrite $socket, $buffer;
+			}
+		);
+		
+		$client->on(
+			connect => sub {
+				Log3($name, 3, "LEDStripe2_WebSocket_Connect $name: WebSocket connected successfully");
+				readingsSingleUpdate($hash, "_WEBSOCKET_STATE", "connected", 1);
+				
+				# Schedule periodic ping
+				InternalTimer(gettimeofday() + 30, "LEDStripe2_WebSocket_Ping", $hash);
+			}
+		);
+		
+		$client->on(
+			disconnect => sub {
+				Log3($name, 3, "LEDStripe2_WebSocket_Connect $name: WebSocket disconnected");
+				readingsSingleUpdate($hash, "_WEBSOCKET_STATE", "disconnected", 1);
+				LEDStripe2_WebSocket_Reconnect($hash);
+			}
+		);
+		
+		# Perform the WebSocket handshake
+		$client->connect;
+		
+		# Store client and socket references
+		$websocketClients{$name} = {
+			client => $client,
+			socket => $socket,
+			connected => 1
+		};
+		
+		# Set socket to non-blocking mode for FHEM integration
+		$socket->blocking(0);
+		
+		Log3($name, 4, "LEDStripe2_WebSocket_Connect $name: WebSocket connection established");
+		return 1;
+	};
+	
+	if ($@) {
+		Log3($name, 2, "LEDStripe2_WebSocket_Connect $name: WebSocket connection failed: $@");
+		readingsSingleUpdate($hash, "_WEBSOCKET_STATE", "error: $@", 1);
+		LEDStripe2_WebSocket_Reconnect($hash);
+		return "";
+	}
+}
+
+###################################
+sub LEDStripe2_WebSocket_Disconnect
+{
+	my ($hash) = @_;
+	my $name = $hash->{NAME};
+	
+	if (exists $websocketClients{$name}) {
+		Log3($name, 4, "LEDStripe2_WebSocket_Disconnect $name: Closing WebSocket connection");
+		
+		my $ws = $websocketClients{$name};
+		if ($ws->{client}) {
+			eval { $ws->{client}->disconnect; };
+		}
+		if ($ws->{socket}) {
+			eval { $ws->{socket}->close; };
+		}
+		
+		delete $websocketClients{$name};
+		readingsSingleUpdate($hash, "_WEBSOCKET_STATE", "disconnected", 1);
+	}
+	
+	# Remove any pending timers
+	RemoveInternalTimer($hash, "LEDStripe2_WebSocket_Ping");
+	RemoveInternalTimer($hash, "LEDStripe2_WebSocket_Reconnect");
+}
+
+###################################
+sub LEDStripe2_WebSocket_Reconnect
+{
+	my ($hash) = @_;
+	my $name = $hash->{NAME};
+	
+	return "" if(IsDisabled($name));
+	return "" if(!AttrVal($name, "useWebSocket", 0));
+	
+	# Remove any existing reconnect timer
+	RemoveInternalTimer($hash, "LEDStripe2_WebSocket_Reconnect");
+	
+	my $interval = AttrVal($name, "websocketReconnectInterval", 30);
+	Log3($name, 4, "LEDStripe2_WebSocket_Reconnect $name: Scheduling reconnect in $interval seconds");
+	
+	InternalTimer(gettimeofday() + $interval, "LEDStripe2_WebSocket_Connect", $hash);
+}
+
+###################################
+sub LEDStripe2_WebSocket_Ping
+{
+	my ($hash) = @_;
+	my $name = $hash->{NAME};
+	
+	return "" if(IsDisabled($name));
+	return "" if(!exists $websocketClients{$name});
+	
+	my $ws = $websocketClients{$name};
+	if ($ws->{client} && $ws->{connected}) {
+		eval {
+			$ws->{client}->ping;
+			Log3($name, 5, "LEDStripe2_WebSocket_Ping $name: Ping sent");
+		};
+		if ($@) {
+			Log3($name, 3, "LEDStripe2_WebSocket_Ping $name: Ping failed: $@");
+			LEDStripe2_WebSocket_Reconnect($hash);
+			return;
+		}
+		
+		# Schedule next ping
+		InternalTimer(gettimeofday() + 30, "LEDStripe2_WebSocket_Ping", $hash);
+	}
+}
+
+###################################
+sub LEDStripe2_WebSocket_OnMessage
+{
+	my ($hash, $message) = @_;
+	my $name = $hash->{NAME};
+	
+	Log3($name, 5, "LEDStripe2_WebSocket_OnMessage $name: Received WebSocket message: $message");
+	
+	eval {
+		my $data = decode_json($message);
+		
+		if (ref($data) eq 'HASH' && exists $data->{name} && exists $data->{value}) {
+			# Handle parameter updates from the LED stripe
+			my $param_name = $data->{name};
+			my $value = $data->{value};
+			
+			Log3($name, 4, "LEDStripe2_WebSocket_OnMessage $name: Parameter update: $param_name = $value");
+			
+			# Convert certain parameter names for FHEM compatibility
+			if ($param_name eq "solidColor") {
+				$value = sprintf("%06x", $value) if ($value =~ /^\d+$/);
+			}
+			
+			# Update the reading
+			readingsSingleUpdate($hash, $param_name, $value, 1);
+			
+			# Update STATE if it's a power parameter
+			if ($param_name eq "power") {
+				$hash->{STATE} = $value ? "on" : "off";
+				readingsSingleUpdate($hash, "state", $hash->{STATE}, 1);
+			}
+		}
+	};
+	
+	if ($@) {
+		Log3($name, 3, "LEDStripe2_WebSocket_OnMessage $name: Failed to parse WebSocket message: $@");
+	}
+}
+
+###################################
+sub LEDStripe2_WebSocket_Send
+{
+	my ($hash, $message) = @_;
+	my $name = $hash->{NAME};
+	
+	return "" if(!exists $websocketClients{$name});
+	
+	my $ws = $websocketClients{$name};
+	if ($ws->{client} && $ws->{connected}) {
+		eval {
+			$ws->{client}->write($message);
+			Log3($name, 5, "LEDStripe2_WebSocket_Send $name: Sent WebSocket message: $message");
+		};
+		if ($@) {
+			Log3($name, 3, "LEDStripe2_WebSocket_Send $name: Failed to send WebSocket message: $@");
+			LEDStripe2_WebSocket_Reconnect($hash);
+		}
+	}
 }
 
 ###################################
@@ -425,6 +684,12 @@ sub LEDStripe2_Define($$)
   
   LEDStripe2_UpdateCommands($hash);
   
+  # Initialize WebSocket connection if enabled
+  if (AttrVal($name, "useWebSocket", 0)) {
+    Log3($name, 3, "LEDStripe2_Define $name: WebSocket enabled, attempting connection");
+    InternalTimer(gettimeofday() + 2, "LEDStripe2_WebSocket_Connect", $hash);
+  }
+  
   return undef;
 }
 #####################################
@@ -456,6 +721,16 @@ sub LEDStripe2_Notify($$)
 			$own_hash->{firstInit} = 0;
 			LEDStripe2_UpdateCommands($own_hash);
 		}
+		
+		# Check for WebSocket attribute changes
+		my $useWebSocket = AttrVal($ownName, "useWebSocket", 0);
+		if ($useWebSocket && !exists $websocketClients{$ownName}) {
+			Log3($ownName, 3, "LEDStripe2_Notify $ownName: WebSocket enabled, starting connection");
+			LEDStripe2_WebSocket_Connect($own_hash);
+		} elsif (!$useWebSocket && exists $websocketClients{$ownName}) {
+			Log3($ownName, 3, "LEDStripe2_Notify $ownName: WebSocket disabled, closing connection");
+			LEDStripe2_WebSocket_Disconnect($own_hash);
+		}
 	}
 	if($devName eq "global" && grep(m/^INITIALIZED|REREADCFG$/, @{$events}))
 	{
@@ -483,6 +758,10 @@ sub LEDStripe2_Undef($$)
 {
    my ( $hash, $arg ) = @_;
    my $name = $hash->{NAME};
+   
+   # Clean up WebSocket connection
+   LEDStripe2_WebSocket_Disconnect($hash);
+   
    RemoveInternalTimer($hash); 
    Log3($name, 3, "LEDStripe2_Undef ".$hash->{name}. " removed ---");
    return undef;
@@ -731,7 +1010,7 @@ sub LEDStripe2_request_nonBlocking
 					keepalive          => 1,
                     hash               => $hash,                             # Muss gesetzt werden, damit die Callback funktion wieder $hash hat
                     method             => "GET",                             # Lesen von Inhalten
-                    header             => HTTP::Request->new( GET => $URL ), # Den Header gemäss abzufragender Daten ändern
+                    header             => HTTP::Request->new( GET => $URL ), # Den Header gemï¿½ss abzufragender Daten ï¿½ndern
                     callback           =>  \&$callBack				#LEDStripe2_ParseHttpResponse    # Diese Funktion soll das Ergebnis dieser HTTP Anfrage bearbeiten
                 };
 	Log3($name, 3, "LEDStripe2_request_nonBlocking $name request: $param->{url} $callBack");
@@ -772,6 +1051,10 @@ sub LEDStripe2_request_nonBlocking
                 <br />Some old commands remain available when set to 1.</li>
     <li><a name="power_switch"><code>attr &lt;name&gt; power_switch &lt;integer&gt;</code></a>
                 <br />Control LED power on/off using s switch channel</li>
+    <li><a name="useWebSocket"><code>attr &lt;name&gt; useWebSocket &lt;0|1&gt;</code></a>
+                <br />Enable WebSocket connection for real-time bidirectional communication (default: 0)</li>
+    <li><a name="websocketReconnectInterval"><code>attr &lt;name&gt; websocketReconnectInterval &lt;10|30|60|120&gt;</code></a>
+                <br />WebSocket reconnection interval in seconds when connection is lost (default: 30)</li>
   </ul>
 
   <a name="LEDStripe2_set"></a>
@@ -858,7 +1141,7 @@ sub LEDStripe2_request_nonBlocking
 		<br />Sets the time a sunrise or sunset effect will take (in minutes - minimum 1 and maximum 120)<br/></li>
 	<br/><b>Other Settings</b>
 	<li><a name="wifiDisabled"><code>set &lt;name&gt; wifiDisabled &lt;on /off&gt;</code></a>
-		<br />can be uised to switch WiFi off on devi´ces with knob/display control on them. <b>Attention:</b>Once activated, the device is no longer accessible via network!<br/></li>
+		<br />can be uised to switch WiFi off on deviï¿½ces with knob/display control on them. <b>Attention:</b>Once activated, the device is no longer accessible via network!<br/></li>
 	<li><a name="currentLimit"><code>set &lt;name&gt; currentLimit &lt;#value&gt;</code></a>
 		<br />Will set the maximum current the LED stripe should draw. <b>Attention:</b> this value is calculated only. The maximum is bound to the number of LEDs in the strip. The current should not exceed your power supply rating nor your cabling rating!<br/></li>
 	<li><a name="colorCorrection"><code>set &lt;name&gt; colorCorrection &lt;TypicalLEDStrip, TypicalPixelString, UncorrectedColor&gt;</code></a>
@@ -893,6 +1176,47 @@ sub LEDStripe2_request_nonBlocking
                 <br />Start sparkling dots (white) light effect on all LEDs<br/></li>
     <li><a name="knightrider"><code>set &lt;name&gt; knightrider &lt;string&gt;</code></a>
                 <br />Start knightrider light effect on all LEDs<br/></li>
+  </ul>
+
+  <a name="LEDStripe2_WebSocket"></a>
+  <h4>WebSocket Support (NEW)</h4>
+  <ul>
+    The module now supports real-time bidirectional communication with LED stripe devices via WebSocket connections.
+    This provides instant updates when parameters are changed through the web interface or knob control.
+    <br/><br/>
+    <b>Requirements:</b> Perl modules Protocol::WebSocket::Client and IO::Socket::INET must be installed for WebSocket support.
+    The module will gracefully fall back to HTTP-only operation if these modules are not available.
+    <br/><br/>
+    <b>Configuration:</b>
+    <br/>
+    <li><code>attr &lt;name&gt; useWebSocket 1</code> - Enable WebSocket connection (default: 0)</li>
+    <li><code>attr &lt;name&gt; websocketReconnectInterval 30</code> - Reconnection interval in seconds (10,30,60,120; default: 30)</li>
+    <br/>
+    <b>Benefits:</b>
+    <ul>
+      <li>Real-time parameter updates from LED stripe to FHEM</li>
+      <li>Instant response to changes made via web interface or knob control</li>
+      <li>Reduced network overhead compared to HTTP polling</li>
+      <li>Automatic reconnection on connection loss</li>
+      <li>Connection health monitoring with ping/pong</li>
+    </ul>
+    <br/>
+    <b>Status Monitoring:</b>
+    <br/>
+    The WebSocket connection status is available in the <code>_WEBSOCKET_STATE</code> reading:
+    <ul>
+      <li><code>connected</code> - WebSocket connection active</li>
+      <li><code>disconnected</code> - WebSocket connection closed</li>
+      <li><code>not_available</code> - Required Perl modules not installed</li>
+      <li><code>error: &lt;message&gt;</code> - Connection error with details</li>
+    </ul>
+    <br/>
+    <b>Example Configuration:</b>
+    <pre>
+    define LED_Kitchen LEDStripe2 ip=192.168.1.100
+    attr LED_Kitchen useWebSocket 1
+    attr LED_Kitchen websocketReconnectInterval 30
+    </pre>
   </ul>
 </ul>
 
